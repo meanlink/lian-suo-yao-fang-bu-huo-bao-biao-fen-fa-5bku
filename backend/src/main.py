@@ -30,7 +30,6 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], all
 class Login(BaseModel): email:str; password:str
 class SnapshotIn(BaseModel): store_code:str; store_name:str; sku:str; product_name:str; category:str; on_hand:float; daily_sales:list[float]; lead_time_days:int=2; safety_days:float=2; pack_size:int=10; expiry_date:str|None=None; substitute_sku:str|None=None; substitute_name:str|None=None; snapshot_date:str='2026-11-21'
 class OverrideIn(BaseModel): qty:int=Field(ge=0); note:str=Field(min_length=3)
-class ReviewIn(BaseModel): decision:str; note:str=''
 class DispatchIn(BaseModel): recipient_name:str; shift:str
 
 @app.get('/health')
@@ -87,25 +86,48 @@ def submit(rid:int,user=Depends(require('inventory_clerk','regional_manager'))):
     query('UPDATE replenishment_recommendations SET status=%s WHERE id=%s',('submitted',rid),fetch=False); return {'status':'submitted'}
 @app.get('/approvals')
 def approvals(user=Depends(current_user)):
-    rows,_=query('SELECT a.*,r.recommended_qty,r.status recommendation_status,s.product_name,s.store_name FROM approval_orders a JOIN replenishment_recommendations r ON r.id=a.recommendation_id JOIN inventory_snapshots s ON s.id=r.snapshot_id ORDER BY a.id DESC')
+    rows,_=query('''SELECT a.*,r.recommended_qty,r.status recommendation_status,s.product_name,s.store_name,s.sku,
+                    c.status shortage_status,c.shortage_qty
+                    FROM approval_orders a
+                    JOIN replenishment_recommendations r ON r.id=a.recommendation_id
+                    JOIN inventory_snapshots s ON s.id=r.snapshot_id
+                    LEFT JOIN shortage_cases c ON c.snapshot_id=a.shortage_id ORDER BY a.id DESC''')
     return rows
 @app.post('/approvals/{rid}')
-def create_approval(rid:int,user=Depends(require('inventory_clerk','regional_manager'))):
-    rows,_=query('SELECT r.*,s.store_code FROM replenishment_recommendations r JOIN inventory_snapshots s ON s.id=r.snapshot_id WHERE r.id=%s',(rid,))
+def create_approval(rid:int,payload:operations.ApprovalLink|None=None,user=Depends(require('inventory_clerk','regional_manager'))):
+    rows,_=query('SELECT r.*,s.store_code,s.sku FROM replenishment_recommendations r JOIN inventory_snapshots s ON s.id=r.snapshot_id WHERE r.id=%s',(rid,))
     if not rows or rows[0]['status'] not in ('submitted','overridden'): raise HTTPException(409,'只有已提交或已改写的建议可以送审')
-    _,aid=query('INSERT INTO approval_orders(recommendation_id,store_code,delivery_shift,approved_qty) VALUES(%s,%s,%s,%s)',(rid,rows[0]['store_code'],'morning',rows[0]['recommended_qty']),fetch=False)
-    return {'id':aid,'status':'pending'}
+    shortage_id=payload.shortage_id if payload else None
+    with operations.operational_transaction() as cursor:
+        if shortage_id:
+            operations.lock_shortage_link(cursor,shortage_id,rows[0]['store_code'],rows[0]['sku'])
+        cursor.execute('INSERT INTO approval_orders(recommendation_id,store_code,delivery_shift,approved_qty,shortage_id) VALUES(%s,%s,%s,%s,%s)',(rid,rows[0]['store_code'],'morning',rows[0]['recommended_qty'],shortage_id))
+        aid=cursor.lastrowid
+        if shortage_id:
+            operations.audit(cursor,user['sub'],'shortage_linked','approval_order',aid,shortage_id=shortage_id)
+    return {'id':aid,'status':'pending','shortage_id':shortage_id}
 @app.put('/approvals/{aid}')
-def review(aid:int,payload:ReviewIn,user=Depends(require('regional_manager'))):
-    if payload.decision not in ('approved','rejected'): raise HTTPException(422,'decision 必须为 approved 或 rejected')
-    rows,_=query('SELECT * FROM approval_orders WHERE id=%s',(aid,))
-    if not rows or rows[0]['status']!='pending': raise HTTPException(409,'审核单当前不可操作')
-    query('UPDATE approval_orders SET status=%s,reviewer_id=%s,review_note=%s,reviewed_at=NOW() WHERE id=%s',(payload.decision,user['sub'],payload.note,aid),fetch=False)
-    if payload.decision=='approved': query('UPDATE replenishment_recommendations SET status=%s WHERE id=%s',('approved',rows[0]['recommendation_id']),fetch=False)
-    return {'status':payload.decision}
+def review(aid:int,payload:operations.Review,user=Depends(require('regional_manager'))):
+    with operations.operational_transaction() as cursor:
+        cursor.execute('''SELECT a.*,s.store_code,s.sku FROM approval_orders a
+                          JOIN replenishment_recommendations r ON r.id=a.recommendation_id
+                          JOIN inventory_snapshots s ON s.id=r.snapshot_id WHERE a.id=%s''',(aid,))
+        order=cursor.fetchone()
+        if not order: raise HTTPException(404,'审核单不存在')
+        # Lock the shortage case before the approval row so we share resolve's lock order.
+        if payload.shortage_id:
+            operations.lock_shortage_link(cursor,payload.shortage_id,order['store_code'],order['sku'])
+        cursor.execute('SELECT status FROM approval_orders WHERE id=%s FOR UPDATE',(aid,))
+        if cursor.fetchone()['status']!='pending': raise HTTPException(409,'审核单当前不可操作')
+        if payload.shortage_id:
+            cursor.execute('UPDATE approval_orders SET shortage_id=%s WHERE id=%s',(payload.shortage_id,aid))
+            operations.audit(cursor,user['sub'],'shortage_linked','approval_order',aid,shortage_id=payload.shortage_id)
+        cursor.execute('UPDATE approval_orders SET status=%s,reviewer_id=%s,review_note=%s,reviewed_at=NOW() WHERE id=%s',(payload.decision,user['sub'],payload.note,aid))
+        if payload.decision=='approved': cursor.execute('UPDATE replenishment_recommendations SET status=%s WHERE id=%s',('approved',order['recommendation_id']))
+    return {'status':payload.decision,'shortage_id':payload.shortage_id or order['shortage_id']}
 @app.get('/dispatches')
 def dispatches(user=Depends(current_user)):
-    rows,_=query('SELECT d.*,a.store_code,a.approved_qty,s.product_name,s.store_name FROM dispatch_records d JOIN approval_orders a ON a.id=d.approval_id JOIN replenishment_recommendations r ON r.id=a.recommendation_id JOIN inventory_snapshots s ON s.id=r.snapshot_id ORDER BY d.id DESC')
+    rows,_=query('SELECT d.*,a.store_code,a.approved_qty,a.shortage_id,s.product_name,s.store_name FROM dispatch_records d JOIN approval_orders a ON a.id=d.approval_id JOIN replenishment_recommendations r ON r.id=a.recommendation_id JOIN inventory_snapshots s ON s.id=r.snapshot_id ORDER BY d.id DESC')
     return rows
 @app.post('/dispatches/{aid}')
 def dispatch(aid:int,payload:DispatchIn,user=Depends(require('shift_coordinator','regional_manager'))):
@@ -123,6 +145,24 @@ def dispatch(aid:int,payload:DispatchIn,user=Depends(require('shift_coordinator'
     return {'id': dispatch_id, 'status': 'sent'}
 @app.put('/dispatches/{did}/receive')
 def receive(did:int,user=Depends(require('shift_coordinator'))):
-    rows,_=query('SELECT status FROM dispatch_records WHERE id=%s',(did,))
-    if not rows or rows[0]['status']!='sent': raise HTTPException(409,'该分发单当前不可收件确认')
-    query('UPDATE dispatch_records SET status=%s,received_at=NOW() WHERE id=%s',('received',did),fetch=False); return {'status':'received'}
+    with operations.operational_transaction() as cursor:
+        cursor.execute('''SELECT d.status,a.shortage_id FROM dispatch_records d
+                          JOIN approval_orders a ON a.id=d.approval_id WHERE d.id=%s''',(did,))
+        row=cursor.fetchone()
+        if not row: raise HTTPException(404,'分发单不存在')
+        if row['status']=='received':
+            # Signing retries are idempotent: the first receipt is the only one that counts toward a shortage.
+            return {'status':'received','changed':False}
+        if row['status']!='sent': raise HTTPException(409,'该分发单当前不可收件确认')
+        # Lock order matches shortage resolution (case, then its dispatches) to serialize closing checks.
+        if row['shortage_id']:
+            cursor.execute('SELECT snapshot_id FROM shortage_cases WHERE snapshot_id=%s FOR UPDATE',(row['shortage_id'],))
+        cursor.execute('SELECT status FROM dispatch_records WHERE id=%s FOR UPDATE',(did,))
+        current=cursor.fetchone()
+        if not current or current['status']=='received':
+            return {'status':'received','changed':False}
+        if current['status']!='sent': raise HTTPException(409,'该分发单当前不可收件确认')
+        cursor.execute("UPDATE dispatch_records SET status='received',received_at=NOW() WHERE id=%s AND status='sent'",(did,))
+        if cursor.rowcount!=1: raise HTTPException(409,'该分发单当前不可收件确认')
+        operations.audit(cursor,user['sub'],'dispatch_received','dispatch',did,shortage_id=row['shortage_id'])
+    return {'status':'received','changed':True}

@@ -41,11 +41,71 @@ class Enabled(BaseModel):
     enabled: bool
 
 
+class ApprovalLink(BaseModel):
+    shortage_id: int | None = Field(default=None, gt=0)
+
+
+class Review(BaseModel):
+    decision: Literal['approved', 'rejected']
+    note: str = ''
+    shortage_id: int | None = Field(default=None, gt=0)
+
+
+def _column_exists(table, column):
+    rows, _ = query('''SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE()
+                       AND TABLE_NAME=%s AND COLUMN_NAME=%s''', (table, column))
+    return bool(rows)
+
+
+def _index_exists(table, index):
+    rows, _ = query('''SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE()
+                       AND TABLE_NAME=%s AND INDEX_NAME=%s''', (table, index))
+    return bool(rows)
+
+
+def _migrate():
+    """Bring databases created before the shortage rework up to the current shape."""
+    if not _column_exists('shortage_cases', 'store_code'):
+        query('ALTER TABLE shortage_cases ADD COLUMN store_code VARCHAR(40) NULL', fetch=False)
+    if not _column_exists('shortage_cases', 'sku'):
+        query('ALTER TABLE shortage_cases ADD COLUMN sku VARCHAR(40) NULL', fetch=False)
+    if not _column_exists('shortage_cases', 'shortage_qty'):
+        query('ALTER TABLE shortage_cases ADD COLUMN shortage_qty DECIMAL(12,2) NULL', fetch=False)
+    if not _column_exists('shortage_cases', 'open_slot'):
+        query('''UPDATE shortage_cases c JOIN inventory_snapshots s ON s.id=c.snapshot_id
+                 SET c.store_code=COALESCE(c.store_code,s.store_code),c.sku=COALESCE(c.sku,s.sku)''', fetch=False)
+        query('''UPDATE shortage_cases c JOIN inventory_snapshots s ON s.id=c.snapshot_id
+                 LEFT JOIN (SELECT snapshot_id,MAX(id) latest_id FROM replenishment_recommendations
+                            GROUP BY snapshot_id) m ON m.snapshot_id=s.id
+                 LEFT JOIN replenishment_recommendations r ON r.id=m.latest_id
+                 SET c.shortage_qty=COALESCE(c.shortage_qty,GREATEST(0,COALESCE(r.reorder_point,s.on_hand)-s.on_hand))''',
+              fetch=False)
+        # Historical duplicates came from re-counting snapshots; keep the earliest open case.
+        query('''UPDATE shortage_cases c JOIN (SELECT store_code,sku,MIN(snapshot_id) keep_id FROM shortage_cases
+                 WHERE status='open' GROUP BY store_code,sku HAVING COUNT(*)>1) d
+                 ON d.store_code=c.store_code AND d.sku=c.sku AND c.status='open' AND c.snapshot_id<>d.keep_id
+                 SET c.status='resolved',c.resolution=CONCAT('合并到缺货单快照 #',d.keep_id),c.resolved_at=NOW()''', fetch=False)
+        query('''UPDATE shortage_cases SET store_code='' WHERE store_code IS NULL''', fetch=False)
+        query('''UPDATE shortage_cases SET sku=CONCAT('#',snapshot_id) WHERE sku IS NULL''', fetch=False)
+        query('''UPDATE shortage_cases SET shortage_qty=0 WHERE shortage_qty IS NULL''', fetch=False)
+        query('''ALTER TABLE shortage_cases MODIFY store_code VARCHAR(40) NOT NULL,
+                 MODIFY sku VARCHAR(40) NOT NULL, MODIFY shortage_qty DECIMAL(12,2) NOT NULL''', fetch=False)
+        query('''ALTER TABLE shortage_cases ADD COLUMN open_slot TINYINT
+                 GENERATED ALWAYS AS (IF(status='open',1,NULL)) STORED''', fetch=False)
+    if not _index_exists('shortage_cases', 'uq_shortage_open'):
+        query('ALTER TABLE shortage_cases ADD UNIQUE KEY uq_shortage_open (store_code,sku,open_slot)', fetch=False)
+    if not _column_exists('approval_orders', 'shortage_id'):
+        query('ALTER TABLE approval_orders ADD COLUMN shortage_id INT NULL', fetch=False)
+    if not _index_exists('approval_orders', 'ix_approval_shortage'):
+        query('ALTER TABLE approval_orders ADD KEY ix_approval_shortage (shortage_id)', fetch=False)
+
+
 def initialize():
     schema = Path(__file__).resolve().parents[1] / 'operations.sql'
     for statement in schema.read_text().split(';'):
         if statement.strip():
             query(statement, fetch=False)
+    _migrate()
 
 
 @contextmanager
@@ -96,45 +156,118 @@ def expiry_action(snapshot_id: int, data: ExpiryAction, user=Depends(INVENTORY))
     return {'action': data.action}
 
 
+def _shortage_receipts(cur, shortage_id):
+    cur.execute('''SELECT d.id dispatch_id,d.approval_id,d.status,d.recipient_name,d.shift,
+                   d.dispatched_at,d.received_at,a.approved_qty
+                   FROM approval_orders a JOIN dispatch_records d ON d.approval_id=a.id
+                   WHERE a.shortage_id=%s ORDER BY d.id''', (shortage_id,))
+    return cur.fetchall()
+
+
+def lock_shortage_link(cur, shortage_id, store_code, sku):
+    """Only the open case for the same store and SKU may be credited by another transfer order."""
+    cur.execute('''SELECT snapshot_id,store_code,sku,shortage_qty,status FROM shortage_cases
+                   WHERE snapshot_id=%s FOR UPDATE''', (shortage_id,))
+    case = cur.fetchone()
+    if not case:
+        raise HTTPException(409, '缺货升级记录不存在')
+    if case['status'] != 'open':
+        raise HTTPException(409, '该缺货升级已结案，不能再关联调货单')
+    if case['store_code'] != store_code or case['sku'] != sku:
+        raise HTTPException(409, '只能关联同一门店同一药品的缺货升级')
+    return case
+
+
 @router.get('/shortage-board')
 def shortages(_user=Depends(current_user)):
+    # One open case per store+SKU survives new count sheets; the latest snapshot is the row identity.
     rows, _ = query(f'''SELECT s.id,s.store_code,s.sku,s.product_name,s.on_hand,r.reorder_point,
-                       c.status,c.note,c.resolution FROM inventory_snapshots s
-                       JOIN replenishment_recommendations r ON r.id=(SELECT MAX(id) FROM replenishment_recommendations WHERE snapshot_id=s.id)
-                       LEFT JOIN shortage_cases c ON c.snapshot_id=s.id
-                       WHERE ({LATEST} AND s.on_hand<r.reorder_point) OR c.snapshot_id IS NOT NULL
-                       ORDER BY COALESCE(c.status='open',FALSE) DESC,s.id''')
-    return rows
+                       c.snapshot_id case_snapshot_id,c.shortage_qty,c.status,c.note,c.resolution,
+                       c.opened_at,c.resolved_at,
+                       COALESCE((SELECT SUM(a.approved_qty) FROM approval_orders a
+                                 JOIN dispatch_records d ON d.approval_id=a.id AND d.status='received'
+                                 WHERE a.shortage_id=c.snapshot_id),0) received_qty
+                       FROM inventory_snapshots s
+                       LEFT JOIN replenishment_recommendations r ON r.id=(SELECT MAX(id) FROM replenishment_recommendations WHERE snapshot_id=s.id)
+                       LEFT JOIN shortage_cases c ON c.store_code=s.store_code AND c.sku=s.sku
+                            AND c.status='open'
+                       WHERE {LATEST} AND (c.snapshot_id IS NOT NULL OR (r.id IS NOT NULL AND s.on_hand<r.reorder_point))
+                       ORDER BY c.status='open' DESC,s.store_code,s.sku''')
+    history, _ = query(f'''SELECT NULL id,c.store_code,c.sku,s.product_name,s.on_hand,r.reorder_point,
+                          c.snapshot_id case_snapshot_id,c.shortage_qty,c.status,c.note,c.resolution,
+                          c.opened_at,c.resolved_at,
+                          COALESCE((SELECT SUM(a.approved_qty) FROM approval_orders a
+                                    JOIN dispatch_records d ON d.approval_id=a.id AND d.status='received'
+                                    WHERE a.shortage_id=c.snapshot_id),0) received_qty
+                          FROM shortage_cases c JOIN inventory_snapshots s ON s.id=c.snapshot_id
+                          LEFT JOIN replenishment_recommendations r ON r.id=(SELECT MAX(id) FROM replenishment_recommendations WHERE snapshot_id=s.id)
+                          WHERE c.status='resolved' ORDER BY c.resolved_at DESC,c.snapshot_id DESC''')
+    with operational_transaction() as cur:
+        for row in rows + history:
+            row['shortage_qty'] = float(row['shortage_qty'] or 0)
+            row['received_qty'] = float(row['received_qty'] or 0)
+            row['remaining_qty'] = max(0.0, row['shortage_qty'] - row['received_qty'])
+            row['receipts'] = _shortage_receipts(cur, row['case_snapshot_id']) if row['case_snapshot_id'] else []
+    return rows + history
 
 
 @router.post('/shortage-board/{snapshot_id}', status_code=201)
 def escalate(snapshot_id: int, data: Note, user=Depends(INVENTORY)):
     with operational_transaction() as cur:
-        cur.execute(f'''SELECT s.id FROM inventory_snapshots s JOIN replenishment_recommendations r
+        cur.execute(f'''SELECT s.id,s.store_code,s.sku,s.on_hand,r.reorder_point FROM inventory_snapshots s
+                     JOIN replenishment_recommendations r
                      ON r.id=(SELECT MAX(id) FROM replenishment_recommendations WHERE snapshot_id=s.id)
                      WHERE s.id=%s AND {LATEST} AND s.on_hand<r.reorder_point FOR UPDATE''', (snapshot_id,))
-        if not cur.fetchone():
+        snapshot = cur.fetchone()
+        if not snapshot:
             raise HTTPException(409, '请对库存不足的最新快照先运行预测')
+        # An earlier count sheet may still own the open case for this store+SKU; keep following it.
+        cur.execute('''SELECT snapshot_id FROM shortage_cases
+                       WHERE store_code=%s AND sku=%s AND status='open' FOR UPDATE''',
+                    (snapshot['store_code'], snapshot['sku']))
+        existing = cur.fetchone()
+        if existing:
+            raise HTTPException(409, f'该门店该药品已有未结缺货升级（快照 #{existing["snapshot_id"]}），请继续跟进')
+        shortage_qty = max(0, float(snapshot['reorder_point']) - float(snapshot['on_hand']))
         try:
-            cur.execute('INSERT INTO shortage_cases(snapshot_id,note,opened_by) VALUES(%s,%s,%s)',
-                        (snapshot_id, data.note, user['sub']))
+            cur.execute('''INSERT INTO shortage_cases(snapshot_id,store_code,sku,shortage_qty,note,opened_by)
+                           VALUES(%s,%s,%s,%s,%s,%s)''',
+                        (snapshot_id, snapshot['store_code'], snapshot['sku'], shortage_qty, data.note, user['sub']))
         except IntegrityError as error:
             if error.errno != 1062:
                 raise
-            raise HTTPException(409, '该快照已登记缺货升级') from error
-        audit(cur, user['sub'], 'shortage_escalated', 'inventory_snapshot', snapshot_id, note=data.note)
-    return {'status': 'open'}
+            raise HTTPException(409, '该门店该药品已有未结缺货升级，请继续跟进原单') from error
+        audit(cur, user['sub'], 'shortage_escalated', 'inventory_snapshot', snapshot_id,
+              store_code=snapshot['store_code'], sku=snapshot['sku'], shortage_qty=shortage_qty, note=data.note)
+    return {'status': 'open', 'shortage_qty': shortage_qty}
 
 
 @router.put('/shortage-board/{snapshot_id}')
 def resolve_shortage(snapshot_id: int, data: Note, user=Depends(MANAGER)):
     with operational_transaction() as cur:
+        cur.execute('''SELECT snapshot_id,store_code,sku,shortage_qty FROM shortage_cases
+                       WHERE store_code=(SELECT store_code FROM inventory_snapshots WHERE id=%s)
+                       AND sku=(SELECT sku FROM inventory_snapshots WHERE id=%s)
+                       AND status='open' FOR UPDATE''', (snapshot_id, snapshot_id))
+        case = cur.fetchone()
+        if not case:
+            raise HTTPException(409, '没有待关闭的缺货升级记录')
+        # Lock linked receipts so a concurrent signing in/out cannot change the total mid-check.
+        cur.execute('''SELECT d.id FROM approval_orders a JOIN dispatch_records d ON d.approval_id=a.id
+                       WHERE a.shortage_id=%s FOR UPDATE''', (case['snapshot_id'],))
+        cur.execute('''SELECT COALESCE(SUM(a.approved_qty),0) received_qty FROM approval_orders a
+                       JOIN dispatch_records d ON d.approval_id=a.id AND d.status='received'
+                       WHERE a.shortage_id=%s''', (case['snapshot_id'],))
+        received = float(cur.fetchone()['received_qty'])
+        if received < float(case['shortage_qty']):
+            raise HTTPException(409, f'签收量不足，尚缺 {float(case["shortage_qty"]) - received:g} 件，不能结案')
         cur.execute('''UPDATE shortage_cases SET status='resolved',resolution=%s,resolved_by=%s,resolved_at=NOW()
-                       WHERE snapshot_id=%s AND status='open' ''', (data.note, user['sub'], snapshot_id))
+                       WHERE snapshot_id=%s AND status='open' ''', (data.note, user['sub'], case['snapshot_id']))
         if cur.rowcount != 1:
             raise HTTPException(409, '没有待关闭的缺货升级记录')
-        audit(cur, user['sub'], 'shortage_resolved', 'inventory_snapshot', snapshot_id, resolution=data.note)
-    return {'status': 'resolved'}
+        audit(cur, user['sub'], 'shortage_resolved', 'inventory_snapshot', case['snapshot_id'],
+              resolution=data.note, shortage_qty=float(case['shortage_qty']), received_qty=received)
+    return {'status': 'resolved', 'shortage_qty': float(case['shortage_qty']), 'received_qty': received}
 
 
 @router.get('/report-subscriptions')

@@ -45,10 +45,12 @@ CREATE TABLE IF NOT EXISTS approval_orders (
   store_code VARCHAR(40) NOT NULL,
   delivery_shift ENUM('morning','afternoon','night') NOT NULL,
   approved_qty INT NOT NULL,
+  shortage_id INT NULL,
   reviewer_id INT NULL,
   status ENUM('pending','approved','rejected','distributed') NOT NULL DEFAULT 'pending',
   review_note VARCHAR(255) NULL,
   reviewed_at TIMESTAMP NULL,
+  KEY ix_approval_shortage (shortage_id),
   FOREIGN KEY (recommendation_id) REFERENCES replenishment_recommendations(id)
 );
 CREATE TABLE IF NOT EXISTS dispatch_records (

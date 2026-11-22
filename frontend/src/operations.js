@@ -30,13 +30,17 @@ async function expiry(root, user) {
 
 async function shortage(root, user) {
   const rows = await get('/shortage-board');
-  root.innerHTML = `<div class="card">${header('门店缺货升级', '最新库存低于再订货点可登记升级，区域经理记录调货结果。')}
-    ${table(['门店 / 商品', '现有库存', '再订货点', '跟进记录', '操作'], rows.map(row => {
+  const receiptLine = row => row.receipts.length ? `<div class="muted">关联签收：${row.receipts.map(r =>
+    `#DP-${String(r.dispatch_id).padStart(4, '0')} · ${r.status === 'received' ? '已签收' : '待签收'} ${r.approved_qty} 件`).join('；')}</div>` : '';
+  root.innerHTML = `<div class="card">${header('门店缺货升级', '同一门店同一药品只保持一张未结缺货单；换盘点单后继续跟原缺货单，按开单时记录的缺口量结案。')}
+    ${table(['门店 / 药品', '现有库存', '再订货点', '缺口 / 已签收 / 还差', '跟进记录', '操作'], rows.map(row => {
       let action = '—';
       if (!row.status && canInventory(user)) action = form(`/shortage-board/${Number(row.id)}`, 'POST', note('升级原因') + button('提交升级'));
       if (row.status === 'open' && user.role === 'regional_manager') action = form(`/shortage-board/${Number(row.id)}`, 'PUT', note('处理结果') + button('关闭升级'));
       const status = row.status === 'resolved' ? `已解决 · ${row.resolution}` : row.status === 'open' ? `跟进中 · ${row.note}` : '待登记';
-      return `<tr>${cells([`${row.store_code} · ${row.product_name}`, row.on_hand, row.reorder_point, status])}<td>${action}</td></tr>`;
+      const gap = row.shortage_qty !== null && row.shortage_qty !== undefined
+        ? `${row.shortage_qty} / ${row.received_qty} / <b>${row.remaining_qty}</b>` : '—';
+      return `<tr>${cells([`${row.store_code} · ${row.product_name}`, row.on_hand, row.reorder_point])}<td>${gap}${receiptLine(row)}</td><td>${escape(status)}${row.status === 'resolved' ? `<div class="muted">开单缺口 ${row.shortage_qty} 件</div>` : ''}</td><td>${action}</td></tr>`;
     }).join(''))}</div>`;
 }
 

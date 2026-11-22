@@ -7,13 +7,18 @@ CREATE TABLE IF NOT EXISTS expiry_actions (
 );
 CREATE TABLE IF NOT EXISTS shortage_cases (
   snapshot_id INT PRIMARY KEY REFERENCES inventory_snapshots(id),
+  store_code VARCHAR(40) NOT NULL,
+  sku VARCHAR(40) NOT NULL,
+  shortage_qty DECIMAL(12,2) NOT NULL,
   status ENUM('open','resolved') NOT NULL DEFAULT 'open',
+  open_slot TINYINT GENERATED ALWAYS AS (IF(status='open',1,NULL)) STORED,
   note VARCHAR(255) NOT NULL,
   opened_by INT NOT NULL REFERENCES users(id),
   opened_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   resolution VARCHAR(255) NULL,
   resolved_by INT NULL REFERENCES users(id),
-  resolved_at TIMESTAMP NULL
+  resolved_at TIMESTAMP NULL,
+  UNIQUE KEY uq_shortage_open (store_code,sku,open_slot)
 );
 CREATE TABLE IF NOT EXISTS report_subscriptions (
   id INT PRIMARY KEY AUTO_INCREMENT,
